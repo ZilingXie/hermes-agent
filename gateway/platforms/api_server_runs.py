@@ -12,13 +12,46 @@ from typing import Any, Dict, List, Optional
 
 try:
     from aiohttp import web
+except ImportError:  # pragma: no cover - aiohttp is a hard runtime dep
+    web = None  # type: ignore[assignment]
+
+try:
+    # Newer aiohttp only; older versions fall back to per-request parsing.
     from aiohttp.web_request import RequestKey
 except ImportError:
-    web = None  # type: ignore[assignment]
     RequestKey = None  # type: ignore[assignment,misc]
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
+from pathlib import Path as _Path
+import re as _re
+
+WORKSPACE_ROOT = _Path("/opt/data/workspaces/support")
+_WORKSPACE_KEY_RE = _re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+
+# In-process session -> workspace bindings. Callers derive keys
+# deterministically from case identity, so a gateway restart rebinds the
+# same key; the binding only guards against cross-case mistakes.
+_SESSION_WORKSPACE_BINDINGS: Dict[str, str] = {}
+_INVALID_WORKSPACE = object()
+_CONFLICT_WORKSPACE = object()
+
+
+def _resolve_run_workspace(session_id: str, workspace_key: Any) -> Any:
+    if workspace_key in (None, ""):
+        return None
+    key = str(workspace_key)
+    if not _WORKSPACE_KEY_RE.fullmatch(key):
+        return _INVALID_WORKSPACE
+    bound = _SESSION_WORKSPACE_BINDINGS.get(str(session_id))
+    if bound is not None and bound != key:
+        return _CONFLICT_WORKSPACE
+    _SESSION_WORKSPACE_BINDINGS[str(session_id)] = key
+    directory = WORKSPACE_ROOT / key
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 _ROOM_RETENTION_REQUEST_KEY = (
     RequestKey("hermes.room_run_retention_until", float)
     if RequestKey is not None
@@ -544,6 +577,34 @@ async def _handle_runs(
                 conversation_history.append({"role": msg["role"], "content": str(content)})
 
     session_id = body.get("session_id") or stored_session_id
+    from aiohttp import web as _web
+
+    run_workspace_key = body.get("workspace_key")
+    run_enabled_toolsets = body.get("enabled_toolsets")
+    if run_enabled_toolsets is not None and not isinstance(run_enabled_toolsets, list):
+        return _web.json_response(
+            _openai_error("enabled_toolsets must be a list of toolset names", code="invalid_request"),
+            status=422,
+        )
+    workspace_dir: Any = None
+    if session_id is not None:
+        workspace_dir = _resolve_run_workspace(str(session_id), run_workspace_key)
+        if workspace_dir is _INVALID_WORKSPACE:
+            return _web.json_response(
+                _openai_error(
+                    "workspace_key must be a lowercase identifier [a-z0-9_-]",
+                    code="invalid_workspace_key",
+                ),
+                status=422,
+            )
+        if workspace_dir is _CONFLICT_WORKSPACE:
+            return _web.json_response(
+                _openai_error(
+                    "session already bound to a different workspace",
+                    code="session_workspace_conflict",
+                ),
+                status=409,
+            )
     route = self._resolve_route(body.get("model"))
     agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
     selection_error = self._request_route_conflict_error(
@@ -729,6 +790,7 @@ async def _handle_runs(
                     route=route,
                     room_dispatch=room_dispatch,
                     room_execution_policy=room_execution_policy,
+                    run_enabled_toolsets=run_enabled_toolsets,
                 )
             self._active_run_agents[run_id] = agent
 
@@ -782,6 +844,29 @@ async def _handle_runs(
                         # contextvars so concurrent runs do not share process
                         # environment state.
                         approval_token = set_current_session_key(approval_session_key)
+                        workspace_token = None
+                        if workspace_dir is not None:
+                            from gateway.session_context import set_session_vars
+
+                            workspace_token = set_session_vars(
+                                chat_id=session_id or "",
+                                session_key=approval_session_key,
+                                session_id=session_id or "",
+                                cwd=str(workspace_dir),
+                            )
+                            try:
+                                from tools.terminal_tool import register_task_env_overrides
+
+                                register_task_env_overrides(
+                                    effective_task_id,
+                                    {"cwd": str(workspace_dir), "cwd_source": "session"},
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "workspace task cwd registration failed for %s",
+                                    effective_task_id,
+                                    exc_info=True,
+                                )
                         session_tokens = self._bind_api_server_session(
                             # chat_id carries the raw session id (the
                             # X-Hermes-Session-Id equivalent) exactly like
@@ -835,6 +920,11 @@ async def _handle_runs(
                             if approval_token is not None:
                                 try:
                                     reset_current_session_key(approval_token)
+                                except Exception:
+                                    pass
+                            if workspace_token is not None:
+                                try:
+                                    clear_session_vars([workspace_token])
                                 except Exception:
                                     pass
                             if session_tokens:

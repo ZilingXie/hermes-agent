@@ -2820,6 +2820,7 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
         room_execution_policy: Optional[Dict[str, Any]] = None,
+        run_enabled_toolsets: Optional[list] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3093,6 +3094,16 @@ class APIServerAdapter(BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
+        elif run_enabled_toolsets:
+            # Request-level narrowing only: the caller may restrict the run to
+            # a subset of the platform's configured toolsets, never extend it.
+            allowed = set(enabled_toolsets)
+            narrowed = [name for name in run_enabled_toolsets if name in allowed]
+            if len(narrowed) != len(run_enabled_toolsets):
+                raise ValueError(
+                    "enabled_toolsets must be a subset of the configured toolsets"
+                )
+            enabled_toolsets = narrowed
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
