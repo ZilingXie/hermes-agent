@@ -283,7 +283,7 @@ RUN cd web && npm run build && \
 # node_modules + source (21s amd64 / 222s arm64 — #49113).  `a+rX,go-w`
 # gives the non-root hermes user read + traverse but no write; root retains
 # write so the build steps below don't need chmod u+w dances.
-COPY --link --chmod=a+rX,go-w . .
+COPY --link --chmod=755 . .
 
 # ---------- Permissions ----------
 # Link hermes-agent itself (editable). Deps are already installed in the
