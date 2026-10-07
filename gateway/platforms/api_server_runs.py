@@ -969,17 +969,30 @@ async def _handle_runs(
             # block below never fires — issue #15561).
             elif isinstance(result, dict) and result.get("failed"):
                 error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                # Carry the structured machine-readable cause (e.g.
+                # 'session_persistence_failed:io') through to the run.failed
+                # event and the pollable/persisted status so consumers can
+                # branch on the cause instead of re-parsing prose. Optional
+                # and additive — absent for failures that never classified.
+                failure_reason = result.get("failure_reason")
+                failure_reason_fields = (
+                    {"failure_reason": failure_reason}
+                    if isinstance(failure_reason, str) and failure_reason
+                    else {}
+                )
                 _put_event_if_active({
                     "event": "run.failed",
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "error": error_msg,
+                    **failure_reason_fields,
                 })
                 self._set_run_status(
                     run_id,
                     "failed",
                     error=error_msg,
                     last_event="run.failed",
+                    **failure_reason_fields,
                 )
             else:
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""

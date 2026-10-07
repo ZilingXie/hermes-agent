@@ -2120,6 +2120,53 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
     return any(marker in lowered for marker in _DISK_FULL_MARKERS)
 
 
+# SQLITE_IOERR primary result code (SQLite returns it alone or as the base of
+# extended codes like SQLITE_IOERR_READ = 10 | (1<<8)).
+_SQLITE_IOERR_PRIMARY_CODE = 10
+
+# The canonical message text for the same class, matched as a fallback for
+# exceptions whose code was lost to RPC/queue wrapping.
+_SQLITE_IOERR_TEXT_MARKERS = ("disk i/o error", "input/output error")
+
+
+def sqlite_error_code_and_name(
+    exc: BaseException | str | None,
+) -> tuple[int | None, str | None]:
+    """Extract ``(sqlite_errorcode, sqlite_errorname)`` when *exc* carries them.
+
+    Python 3.11+ sqlite3 exceptions expose both attributes; wrapped/remote
+    exceptions and plain strings return ``(None, None)``.
+    """
+    if exc is None or isinstance(exc, str):
+        return None, None
+    code = getattr(exc, "sqlite_errorcode", None)
+    name = getattr(exc, "sqlite_errorname", None)
+    return (
+        int(code) if isinstance(code, int) else None,
+        name if isinstance(name, str) else None,
+    )
+
+
+def is_sqlite_io_error(exc: BaseException | str | None) -> bool:
+    """True when *exc* is a SQLite I/O error (SQLITE_IOERR family).
+
+    Primary signal is the SQLite result code (primary code 10); the message
+    text is a fallback for wrapped errors. Corruption, disk-full, and
+    read-only failures have their own messages and are NOT IOERR — callers
+    that need those separated must check them first (as
+    :func:`classify_persistence_error` does); this helper matches the raw
+    class only, so it stays usable from the transaction retry path where the
+    disk-full/corrupt buckets have already been ruled out by classification.
+    """
+    if exc is None:
+        return False
+    code, _name = sqlite_error_code_and_name(exc)
+    if code is not None:
+        return (code & 0xFF) == _SQLITE_IOERR_PRIMARY_CODE
+    text = str(exc).lower()
+    return any(marker in text for marker in _SQLITE_IOERR_TEXT_MARKERS)
+
+
 # Every cause bucket classify_persistence_error can return. Consumers that
 # enumerate causes (e.g. the cron scheduler's explainer-variant suppression)
 # must iterate this tuple instead of hardcoding the list, so adding a bucket
@@ -2132,6 +2179,7 @@ PERSISTENCE_ERROR_CAUSES = (
     "corrupt",
     "replaced",
     "disk",
+    "io",
     "unknown",
 )
 
@@ -2182,6 +2230,12 @@ def classify_persistence_error(exc_or_str) -> str:
     * ``"disk"``    — disk full / read-only / permission-shaped failures
       (delegates the disk-full patterns to :func:`is_disk_full_error` so the
       two classifiers can never drift apart — e.g. ENOSPC).
+    * ``"io"``     — a SQLite I/O-layer fault (SQLITE_IOERR family /
+      ``disk I/O error``) that is neither corruption nor space nor
+      read-only. Typically the storage backend beneath the database
+      (network filesystem, mount, device); there is no deterministic
+      self-service fix, so the guidance must stay diagnostic, not
+      prescriptive.
     * ``"unknown"`` — anything else (or no visible exception at all).
     """
     if exc_or_str is None:
@@ -2219,6 +2273,13 @@ def classify_persistence_error(exc_or_str) -> str:
         or "busy" in text
     ):
         return "locked"
+    # SQLITE_IOERR before the catch-all disk bucket: "disk I/O error" contains
+    # "disk", so without this branch every I/O failure is misreported as the
+    # deterministic "free some space (or fix state.db permissions)" advice
+    # (the AC-13898 misdiagnosis). Corruption and disk-full are already
+    # matched above, so what reaches here is a genuine I/O-layer fault.
+    if is_sqlite_io_error(exc_or_str):
+        return "io"
     if (
         is_disk_full_error(exc_or_str)
         or "disk" in text
@@ -5789,6 +5850,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         fn: Callable[[sqlite3.Connection], T],
         patience_s: Optional[float] = None,
+        transcript_io_retry: bool = False,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -5812,6 +5874,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         millisecond contention and backs off to 250ms-1s once the lock has
         been held longer than ``_WRITE_RETRY_SLOW_AFTER_S``.
 
+        ``transcript_io_retry`` opts this ONE write into a single
+        post-rollback retry for SQLite I/O errors (SQLITE_IOERR family).
+        It is a transcript-flush-only mechanism (see
+        :meth:`append_messages_batch`): the retry fires only when the
+        exception came from the *fn* body — before COMMIT — the rollback
+        succeeded, the connection is verifiably out of the transaction,
+        and the database file identity is unchanged, so replaying the
+        same batch on the same connection cannot double-apply anything.
+        A failure during COMMIT has an unknown outcome and is never
+        retried; disk-full, read-only, corruption, and lock contention
+        keep their existing dedicated handling.
+
         Returns whatever *fn* returns.
         """
         if patience_s is None:
@@ -5820,6 +5894,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
         compression_deadline: Optional[float] = None
+        # One-shot transcript I/O retry budget (see transcript_io_retry).
+        io_retry_used = False
+        # Which transaction phase raised, so the I/O retry can prove the
+        # failure happened BEFORE commit: "begin" / "write" / "commit".
+        txn_phase = "begin"
+        # Whether the post-failure rollback actually succeeded — a failed
+        # rollback means the transaction state is unknown and nothing may
+        # be retried or assumed rolled back.
+        rollback_ok = True
 
         # Transient engine-level error observed on contended WAL appends
         # (dual gateway/agent writers; FTS5 trigram sync holds the write
@@ -5833,6 +5916,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         while True:
             self._raise_if_db_replaced()
+            txn_phase = "begin"
+            rollback_ok = True
             try:
                 with self._lock:
                     if self._conn is None:
@@ -5840,14 +5925,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # (#94736) — reopen instead of dying on None.execute.
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
+                    txn_phase = "write"
                     try:
                         result = fn(self._conn)
+                        txn_phase = "commit"
                         self._conn.commit()
                     except BaseException:
+                        # Record whether the rollback actually landed: a
+                        # rollback that itself raised leaves the transaction
+                        # state unknown, which forbids any retry and must be
+                        # visible in diagnostics.
                         try:
                             self._conn.rollback()
-                        except Exception:
-                            pass
+                        except Exception as rollback_exc:
+                            rollback_ok = False
+                            _rb_code, _rb_name = sqlite_error_code_and_name(
+                                rollback_exc
+                            )
+                            logger.warning(
+                                "rollback failed after %s-phase transaction "
+                                "failure (sqlite_error=%s/%s): %s",
+                                txn_phase,
+                                _rb_code,
+                                _rb_name,
+                                rollback_exc,
+                            )
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
@@ -5893,6 +5995,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     ) from exc
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
+                # Transcript-only single I/O retry: SQLITE_IOERR raised by the
+                # fn body (pre-COMMIT) with a provably clean rollback, an
+                # out-of-transaction connection, and an unchanged database
+                # file is safe to replay exactly once on the same connection
+                # with the same batch. Everything else — COMMIT-phase failures
+                # (outcome unknown), failed rollbacks, replaced databases, and
+                # non-IOERR errors — keeps propagating.
+                if (
+                    transcript_io_retry
+                    and not io_retry_used
+                    and txn_phase == "write"
+                    and rollback_ok
+                    and is_sqlite_io_error(exc)
+                ):
+                    io_retry_used = True
+                    # Re-check file identity AFTER the failure: an I/O error
+                    # can accompany an out-of-band restore. Raises
+                    # StateDbReplacedError when identity moved, which is not
+                    # caught here — the write stops, as it must.
+                    self._raise_if_db_replaced()
+                    if self._conn is not None and not self._conn.in_transaction:
+                        _io_code, _io_name = sqlite_error_code_and_name(exc)
+                        logger.warning(
+                            "transcript write hit a pre-commit SQLite I/O "
+                            "error (sqlite_error=%s/%s) with a clean "
+                            "rollback; retrying the same batch once after "
+                            "100ms",
+                            _io_code,
+                            _io_name,
+                        )
+                        time.sleep(0.1)
+                        continue
+                    logger.warning(
+                        "transcript I/O retry skipped: connection still in "
+                        "transaction after rollback"
+                    )
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
@@ -11969,8 +12107,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
+        # transcript_io_retry opts ONLY this flush into _execute_write's
+        # single post-rollback I/O retry (pre-COMMIT SQLITE_IOERR with a
+        # provably clean rollback and unchanged file identity — see
+        # _execute_write). A turn-boundary flush is the one write whose
+        # in-memory state is rebuilt deterministically from the same batch
+        # by resolve_and_repair_transcript_batch, so a replay cannot
+        # double-apply rows or counters.
         return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            transcript_io_retry=True,
         )
 
     def set_latest_matching_message_display_kind(

@@ -7746,6 +7746,7 @@ def run_conversation(
                         "(session=%s): %s",
                         agent.session_id or "none",
                         exc,
+                        exc_info=True,
                     )
 
                 if _tool_turn_persisted is False:

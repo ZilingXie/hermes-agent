@@ -2553,9 +2553,23 @@ class AIAgent:
                 StateDbReplacedError,
                 classify_persistence_error,
                 divert_session_transcript_jsonl,
+                sqlite_error_code_and_name,
             )
 
             self._last_persistence_error_cause = classify_persistence_error(e)
+            # Structured diagnosis for the failure path: session id, cause
+            # bucket, SQLite result code/name when present, and the stack —
+            # never message bodies, tool args, or credentials.
+            _sqlite_code, _sqlite_name = sqlite_error_code_and_name(e)
+            logger.error(
+                "Session DB transcript flush failed (session=%s cause=%s "
+                "sqlite_error=%s/%s)",
+                getattr(self, "session_id", None),
+                self._last_persistence_error_cause,
+                _sqlite_code,
+                _sqlite_name,
+                exc_info=True,
+            )
             if isinstance(e, StateDbReplacedError):
                 try:
                     divert_session_transcript_jsonl(
@@ -4318,6 +4332,18 @@ class AIAgent:
                     "restart). This is often a full disk — free some space "
                     "(or fix state.db permissions), then send your message "
                     "again."
+                )
+            if cause == "io":
+                return (
+                    prefix
+                    + "the turn was stopped because the session database "
+                    "reported an I/O error while saving (the transcript "
+                    "would have been lost on restart). The database file is "
+                    "reachable and is neither full nor corrupt, so freeing "
+                    "disk space or changing permissions is unlikely to help "
+                    "— the usual cause is the storage layer beneath it "
+                    "(network filesystem, mount, or device). Check that "
+                    "storage, then send your message again."
                 )
             return (
                 prefix
