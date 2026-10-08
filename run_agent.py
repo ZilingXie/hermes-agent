@@ -4336,14 +4336,13 @@ class AIAgent:
             if cause == "io":
                 return (
                     prefix
-                    + "the turn was stopped because the session database "
-                    "reported an I/O error while saving (the transcript "
-                    "would have been lost on restart). The database file is "
-                    "reachable and is neither full nor corrupt, so freeing "
-                    "disk space or changing permissions is unlikely to help "
-                    "— the usual cause is the storage layer beneath it "
-                    "(network filesystem, mount, or device). Check that "
-                    "storage, then send your message again."
+                    + "the turn was stopped because saving the session "
+                    "hit an I/O error (the transcript would have been lost "
+                    "on restart). The underlying storage cause is not yet "
+                    "determined — freeing disk space or changing state.db "
+                    "permissions is not a verified fix. Check the storage "
+                    "layer beneath the database (filesystem, mount, or "
+                    "device health), then send your message again."
                 )
             return (
                 prefix

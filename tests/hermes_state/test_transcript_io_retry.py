@@ -303,6 +303,108 @@ class TestTranscriptIoRetry:
         assert [r["role"] for r in rows] == ["user", "assistant", "user", "assistant"]
 
 
+class TestRetryPreservesMessagesAfterRollback:
+    """P1 regression: in-transaction row ids stamped into the row dicts
+    survive ROLLBACK (verified: this SQLite build reuses rolled-back
+    AUTOINCREMENT ids), and a concurrent writer can claim the freed id
+    during the retry window. The replay must restore the batch's entry
+    state or the stale id makes resolve_and_repair_transcript_batch adopt
+    an unrelated row and silently drop the message."""
+
+    def _real(self):
+        return SessionDB._insert_message_rows
+
+    def test_partial_insert_then_ioerr_keeps_all_messages(self, db):
+        """First attempt inserts SOME rows then fails pre-commit; the retry
+        must re-insert the whole batch — no loss, no duplicates, counters
+        exact."""
+        real = self._real()
+        state = {"calls": 0}
+
+        def partial_then_fail(self_, conn, session_id, msgs):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                real(self_, conn, session_id, msgs[:1])
+                raise sqlite3.OperationalError("disk I/O error")
+            return real(self_, conn, session_id, msgs)
+
+        msgs = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "assistant", "content": "a2", "finish_reason": "stop"},
+        ]
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(SessionDB, "_insert_message_rows", partial_then_fail)
+            inserted = db.append_messages_batch("sess-io", msgs)
+        assert inserted == 3
+        assert state["calls"] == 2
+        rows = db._conn.execute(
+            "SELECT role FROM messages WHERE session_id='sess-io' ORDER BY id"
+        ).fetchall()
+        assert [r["role"] for r in rows] == ["user", "assistant", "assistant"]
+        count = db._conn.execute(
+            "SELECT message_count FROM sessions WHERE id='sess-io'"
+        ).fetchone()[0]
+        assert count == 3
+
+    def test_rowid_reuse_after_rollback_does_not_drop_message(self, db):
+        """The exact review scenario: attempt 1 stamps fresh row ids and
+        rolls back; during the 100ms retry window a concurrent write reuses
+        the freed row id; the retry must still land every batch message."""
+        import hermes_state as hs
+
+        real = self._real()
+        state = {"calls": 0}
+
+        def fail_after_stamp(self_, conn, session_id, msgs):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                real(self_, conn, session_id, msgs)  # stamps _row_id dicts
+                raise sqlite3.OperationalError("disk I/O error")
+            return real(self_, conn, session_id, msgs)
+
+        msgs = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "answer", "finish_reason": "stop"},
+        ]
+        stamped = {}
+
+        def fake_sleep(_seconds):
+            stamped["assistant"] = msgs[1].get("_row_id")
+            assert stamped["assistant"] is not None, "stale stamp expected"
+            # Concurrent writer inside the retry window: claims the exact
+            # row ids the rollback freed (AUTOINCREMENT reuses rolled-back
+            # ids), including the assistant's stale id, exactly like the
+            # review's repro (message B reuses row 1 after A rolled back).
+            db._execute_write(
+                lambda conn: real(
+                    db, conn, "sess-io",
+                    [
+                        {"role": "user", "content": "concurrent-q"},
+                        {"role": "assistant", "content": "concurrent",
+                         "finish_reason": "stop"},
+                    ],
+                )
+            )
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(SessionDB, "_insert_message_rows", fail_after_stamp)
+            mp.setattr(hs.time, "sleep", fake_sleep)
+            inserted = db.append_messages_batch("sess-io", msgs)
+        assert inserted == 2
+        rows = db._conn.execute(
+            "SELECT content FROM messages WHERE session_id='sess-io' ORDER BY id"
+        ).fetchall()
+        contents = [r["content"] for r in rows]
+        assert "answer" in contents, "original batch message was dropped"
+        assert "concurrent" in contents, "concurrent write was lost"
+        assert contents.count("answer") == 1
+        # 2 batch messages + 2 concurrent writes, nothing doubled.
+        assert len(contents) == 4
+        # The batch's final row id is a fresh, correctly-adopted id.
+        assert isinstance(msgs[1].get("_row_id"), int)
+
+
 class TestIoWording:
     """The user-facing io explanation stays diagnostic (no deterministic
     free-space/permissions advice) — the AC-13898 misdiagnosis."""
@@ -322,8 +424,13 @@ class TestIoWording:
         # Must NOT prescribe the disk bucket's advice.
         assert "free some space" not in text
         assert "fix state.db permissions" not in text
-        # Points at the storage layer beneath the file instead.
-        assert "storage layer" in text
+        # Must not assert unverified health conclusions either (review P2:
+        # the io classification runs no reachability/space/integrity check).
+        assert "reachable" not in text
+        assert "neither full nor corrupt" not in text
+        assert "not yet determined" in text
+        # Points at checking the storage layer instead.
+        assert "storage" in text
 
     def test_disk_wording_unchanged(self):
         text = self._explain("disk")

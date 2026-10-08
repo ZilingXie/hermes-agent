@@ -12068,7 +12068,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return inserted_total
 
+        # Entry snapshot of the volatile in-memory keys the transaction body
+        # may stamp into the row dicts: _insert_message_rows writes fresh
+        # lastrowid values and resolve_and_repair_transcript_batch may stamp
+        # target row ids / canonical content. A ROLLBACK does NOT undo those
+        # in-memory writes, and a stale row id on replay is dangerous — the
+        # retried resolve step would SELECT that id, find an unrelated row a
+        # concurrent writer reused after the rollback, and silently drop the
+        # message it belonged to (review P1). Every attempt therefore starts
+        # by restoring the batch to its entry state; caller-supplied ids that
+        # existed before the flush are preserved.
+        _entry_state = [
+            {
+                "_row_id": m.get("_row_id"),
+                "_canonical_content": m.get("_canonical_content"),
+                "_has_canonical": "_canonical_content" in m,
+            }
+            for m in messages
+        ]
+
+        def _restore_entry_state() -> None:
+            for m, snap in zip(messages, _entry_state):
+                if snap["_row_id"] is None:
+                    m.pop("_row_id", None)
+                else:
+                    m["_row_id"] = snap["_row_id"]
+                if snap["_has_canonical"]:
+                    m["_canonical_content"] = snap["_canonical_content"]
+                else:
+                    m.pop("_canonical_content", None)
+
         def _do(conn):
+            # Replay-safe start: undo any volatile keys a previous, rolled-
+            # back attempt stamped into these dicts (see _entry_state above).
+            _restore_entry_state()
             self._check_transcript_write_guards(
                 conn,
                 session_id,
