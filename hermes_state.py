@@ -5907,7 +5907,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # failure happened BEFORE commit: "begin" / "write" / "commit".
         txn_phase = "begin"
 
-        def _record_txn_failure(exc: BaseException) -> None:
+        def _record_txn_failure(exc: BaseException, carrier: BaseException | None = None) -> None:
             """Final-failure diagnostics for every SQLite transaction exit.
 
             The review contract: the surviving log must state which phase
@@ -5916,7 +5916,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             failure leaves the commit outcome uncertain. The same dict
             rides on the exception (hermes_txn_diag) so upper layers
             (run_agent's flush logging) can include it without re-deriving
-            anything."""
+            anything. ``exc`` supplies the SQLite identity (error text,
+            result code, name); ``carrier`` — when the error being handled
+            is re-raised as a DIFFERENT exception (the locked-patience
+            wrapper, or StateDbReplacedError raised from inside the error
+            path) — is the exception that actually leaves this function and
+            therefore the one the diagnostics must attach to (with the
+            original code/name also copied onto it so downstream readers
+            see the real SQLite identity)."""
             _f_code, _f_name = sqlite_error_code_and_name(exc)
             diag = {
                 "phase": txn_phase,
@@ -5940,8 +5947,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 diag["commit_outcome_uncertain"],
                 exc,
             )
+            target = carrier if carrier is not None else exc
             try:
-                setattr(exc, "hermes_txn_diag", diag)
+                setattr(target, "hermes_txn_diag", diag)
+                if carrier is not None and _f_code is not None:
+                    # Preserve the original SQLite identity on the carrier
+                    # so code readers see BUSY/IOERR, not None/None.
+                    setattr(carrier, "sqlite_errorcode", _f_code)
+                    setattr(carrier, "sqlite_errorname", _f_name)
             except Exception:
                 pass
 
@@ -6031,6 +6044,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         continue
                     # Patience exhausted — say what actually happened so the
                     # surfaced error doesn't read as disk/permission damage.
+                    # The wrapper carries the diagnostics AND the original
+                    # SQLite result code/name (e.g. 5/SQLITE_BUSY), so
+                    # observability never degrades to None/None.
                     wrapped = sqlite3.OperationalError(
                         f"database is locked (another Hermes process held the "
                         f"state.db write lock for over {patience_s:.0f}s — "
@@ -6038,7 +6054,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
                     )
-                    _record_txn_failure(wrapped)
+                    _record_txn_failure(exc, carrier=wrapped)
                     raise wrapped from exc
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
@@ -6058,10 +6074,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ):
                     io_retry_used = True
                     # Re-check file identity AFTER the failure: an I/O error
-                    # can accompany an out-of-band restore. Raises
-                    # StateDbReplacedError when identity moved, which is not
-                    # caught here — the write stops, as it must.
-                    self._raise_if_db_replaced()
+                    # can accompany an out-of-band restore. A replacement
+                    # still stops the write (StateDbReplacedError propagates,
+                    # the replay never runs) — but the diagnostics of the
+                    # SQLite error being handled must survive the re-raise
+                    # inside the error path: they are recorded with the
+                    # replacement error as the carrier.
+                    try:
+                        self._raise_if_db_replaced()
+                    except StateDbReplacedError as replaced_exc:
+                        _record_txn_failure(exc, carrier=replaced_exc)
+                        raise
                     if self._conn is not None and not self._conn.in_transaction:
                         _io_code, _io_name = sqlite_error_code_and_name(exc)
                         logger.warning(
@@ -6088,13 +6111,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # An out-of-band replace of state.db (restore/cp/mv under a
                 # live process) surfaces as this same corruption error class.
                 # In-file repair on a NEW file generation amplifies the
-                # damage (#89332) — halt writes on this handle instead.
+                # damage (#89332) — halt writes on this handle instead. The
+                # replacement error carries the diagnostics of the SQLite
+                # error it interrupted (same carrier pattern as the I/O
+                # retry's identity re-check).
                 if (
                     "not a database" in str(exc).lower()
                     or is_malformed_db_error(exc)
                     or self._is_fts_write_corruption_error(exc)
                 ):
-                    self._raise_if_db_replaced()
+                    try:
+                        self._raise_if_db_replaced()
+                    except StateDbReplacedError as replaced_exc:
+                        _record_txn_failure(exc, carrier=replaced_exc)
+                        raise
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
                 # while the canonical messages table is intact. Never run a

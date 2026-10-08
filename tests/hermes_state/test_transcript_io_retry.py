@@ -614,3 +614,76 @@ class TestTransactionFailureDiagnostics:
             assert excinfo.value.hermes_txn_diag["rollback"] == "failed"
         finally:
             db._conn = proxy._real
+
+    def test_replaced_during_io_retry_keeps_diagnostics_on_raised_error(
+        self, db, tmp_path, captured
+    ):
+        """A replacement discovered inside the I/O-retry error path still
+        stops the write, but the StateDbReplacedError that leaves the
+        function must carry the diagnostics of the SQLite error it
+        interrupted (phase/rollback/original code)."""
+        exc_with_code = sqlite3.OperationalError("disk I/O error")
+        exc_with_code.sqlite_errorcode = 266  # SQLITE_IOERR_READ
+        exc_with_code.sqlite_errorname = "SQLITE_IOERR_READ"
+        state = {"calls": 0}
+        real = SessionDB._insert_message_rows
+
+        def injector(self_, conn, session_id, messages):
+            state["calls"] += 1
+            gone = tmp_path / "state.db.gone"
+            os.replace(tmp_path / "state.db", gone)
+            (tmp_path / "state.db").write_bytes(gone.read_bytes()[:4096])
+            os.remove(gone)
+            raise exc_with_code
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(SessionDB, "_insert_message_rows", injector)
+            with pytest.raises(StateDbReplacedError) as excinfo:
+                db.append_messages_batch("sess-io", _turn_messages())
+        assert state["calls"] == 1  # the write stopped, no replay
+        diags = self._diag_records(captured)
+        assert diags, "replacement re-raise lost the transaction diagnostics"
+        diag = getattr(excinfo.value, "hermes_txn_diag", None)
+        assert isinstance(diag, dict)
+        assert diag["phase"] == "write"
+        assert diag["rollback"] == "ok"
+        assert diag["sqlite_errorcode"] == 266
+        assert diag["sqlite_errorname"] == "SQLITE_IOERR_READ"
+
+    def test_locked_patience_exhaustion_preserves_original_code(
+        self, db, captured
+    ):
+        """The locked-patience wrapper exception must carry the ORIGINAL
+        SQLite identity (5/SQLITE_BUSY) and the diagnostics — never
+        degrade observability to None/None."""
+        busy = sqlite3.OperationalError("database is locked")
+        busy.sqlite_errorcode = 5  # SQLITE_BUSY
+        busy.sqlite_errorname = "SQLITE_BUSY"
+        calls = {"n": 0}
+
+        def injector(self_, conn, session_id, messages):
+            calls["n"] += 1
+            raise busy
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(SessionDB, "_insert_message_rows", injector)
+            with pytest.raises(sqlite3.OperationalError) as excinfo:
+                db._execute_write(
+                    lambda conn: SessionDB._insert_message_rows(
+                        db, conn, "sess-io", [{"role": "user", "content": "q"}]
+                    ),
+                    patience_s=0.05,
+                )
+        assert calls["n"] >= 2  # the lock loop retried before giving up
+        wrapped = excinfo.value
+        assert "database is locked" in str(wrapped)
+        # Original SQLite identity preserved on the wrapper.
+        assert getattr(wrapped, "sqlite_errorcode", None) == 5
+        assert getattr(wrapped, "sqlite_errorname", None) == "SQLITE_BUSY"
+        diag = getattr(wrapped, "hermes_txn_diag", None)
+        assert isinstance(diag, dict)
+        assert diag["sqlite_errorcode"] == 5
+        assert diag["sqlite_errorname"] == "SQLITE_BUSY"
+        diags = self._diag_records(captured)
+        assert diags, "no transaction-failure log for lock exhaustion"
+        assert "sqlite_error=5/SQLITE_BUSY" in diags[-1].getMessage()
