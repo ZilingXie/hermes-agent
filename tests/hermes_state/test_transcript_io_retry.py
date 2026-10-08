@@ -86,9 +86,15 @@ class _ConnProxy:
         self._real = real
         self.commit_failures = 0
         self.rollback_failures = 0
+        self.begin_fails = False
 
     def __getattr__(self, name):
         return getattr(self._real, name)
+
+    def execute(self, sql, *args, **kwargs):
+        if self.begin_fails and str(sql).strip().upper().startswith("BEGIN"):
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._real.execute(sql, *args, **kwargs)
 
     def commit(self):
         if self.commit_failures > 0:
@@ -487,3 +493,124 @@ class TestRunStatusFailureReason:
         )
         status = asr._set_run_status(fake, "run-y", "failed", error="boom")
         assert "failure_reason" not in status
+
+
+class TestTransactionFailureDiagnostics:
+    """Round-2 review blocker: EVERY final transaction failure must leave a
+    log record (and an exception-carried hermes_txn_diag) stating the real
+    phase (begin/write/commit), the rollback outcome (not_attempted is
+    distinct from ok), the attempt number, and the COMMIT uncertainty
+    flag — not only the retry-preparation path."""
+
+    @pytest.fixture()
+    def captured(self):
+        import logging
+
+        records: list = []
+
+        class _Handler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _Handler(level=logging.DEBUG)
+        logger = logging.getLogger("hermes_state")
+        logger.addHandler(handler)
+        try:
+            yield records
+        finally:
+            logger.removeHandler(handler)
+
+    def _diag_records(self, records):
+        return [
+            r for r in records
+            if "SQLite transaction failed terminally" in r.getMessage()
+        ]
+
+    def _conn_proxy(self, db, *, begin_fails=False, commit_fails=False,
+                    rollback_fails=False):
+        proxy = _ConnProxy(db._conn)
+        proxy.begin_fails = begin_fails
+        proxy.commit_failures = 1 if commit_fails else 0
+        proxy.rollback_failures = 1 if rollback_fails else 0
+        db._conn = proxy
+        return proxy
+
+    def test_begin_phase_failure_records_not_attempted(self, db, captured):
+        proxy = self._conn_proxy(db, begin_fails=True)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                db.append_messages_batch("sess-io", _turn_messages())
+            diags = self._diag_records(captured)
+            assert diags, "no transaction-failure log for BEGIN failure"
+            msg = diags[-1].getMessage()
+            assert "phase=begin" in msg
+            assert "rollback=not_attempted" in msg
+        finally:
+            db._conn = proxy._real
+
+    def test_commit_phase_failure_records_uncertain(self, db, captured):
+        proxy = self._conn_proxy(db, commit_fails=True)
+        try:
+            with pytest.raises(sqlite3.OperationalError) as excinfo:
+                db.append_messages_batch("sess-io", _turn_messages())
+            diags = self._diag_records(captured)
+            assert diags, "no transaction-failure log for COMMIT failure"
+            msg = diags[-1].getMessage()
+            assert "phase=commit" in msg
+            assert "rollback=ok" in msg
+            assert "commit_outcome_uncertain=True" in msg
+            # The diagnostics ride on the exception for upper layers.
+            diag = getattr(excinfo.value, "hermes_txn_diag", None)
+            assert isinstance(diag, dict)
+            assert diag["phase"] == "commit"
+            assert diag["rollback"] == "ok"
+            assert diag["commit_outcome_uncertain"] is True
+        finally:
+            db._conn = proxy._real
+
+    def test_second_ioerr_failure_records_final_attempt(self, db, captured):
+        injector = _IoerrInjector(db, fail_times=99)
+        with pytest.MonkeyPatch.context() as mp:
+            injector.install(mp)
+            with pytest.raises(sqlite3.OperationalError) as excinfo:
+                db.append_messages_batch("sess-io", _turn_messages())
+        diags = self._diag_records(captured)
+        assert diags, "no transaction-failure log for the exhausted retry"
+        msg = diags[-1].getMessage()
+        assert "phase=write" in msg
+        assert "rollback=ok" in msg
+        assert "attempt=2" in msg
+        assert "io_retry_used=True" in msg
+        assert excinfo.value.hermes_txn_diag["attempt"] == 2
+
+    def test_readonly_failure_records_write_phase(self, db, captured):
+        injector = _IoerrInjector(
+            db, fail_times=1, message="attempt to write a readonly database"
+        )
+        with pytest.MonkeyPatch.context() as mp:
+            injector.install(mp)
+            with pytest.raises(sqlite3.OperationalError) as excinfo:
+                db.append_messages_batch("sess-io", _turn_messages())
+        diags = self._diag_records(captured)
+        assert diags, "no transaction-failure log for the read-only failure"
+        msg = diags[-1].getMessage()
+        assert "phase=write" in msg
+        assert "rollback=ok" in msg
+        assert excinfo.value.hermes_txn_diag["phase"] == "write"
+
+    def test_rollback_failure_records_failed_and_blocks_retry(self, db, captured):
+        injector = _IoerrInjector(db, fail_times=1)
+        proxy = self._conn_proxy(db, rollback_fails=True)
+        try:
+            with pytest.MonkeyPatch.context() as mp:
+                injector.install(mp)
+                with pytest.raises(sqlite3.OperationalError) as excinfo:
+                    db.append_messages_batch("sess-io", _turn_messages())
+            assert injector.calls == 1  # failed rollback forbids the replay
+            diags = self._diag_records(captured)
+            assert diags, "no transaction-failure log after rollback failure"
+            msg = diags[-1].getMessage()
+            assert "rollback=failed" in msg
+            assert excinfo.value.hermes_txn_diag["rollback"] == "failed"
+        finally:
+            db._conn = proxy._real

@@ -2558,18 +2558,38 @@ class AIAgent:
 
             self._last_persistence_error_cause = classify_persistence_error(e)
             # Structured diagnosis for the failure path: session id, cause
-            # bucket, SQLite result code/name when present, and the stack —
-            # never message bodies, tool args, or credentials.
+            # bucket, SQLite result code/name when present, the transaction
+            # layer's own phase/rollback diagnostics (attached by
+            # _execute_write as hermes_txn_diag), and the stack — never
+            # message bodies, tool args, or credentials.
             _sqlite_code, _sqlite_name = sqlite_error_code_and_name(e)
-            logger.error(
-                "Session DB transcript flush failed (session=%s cause=%s "
-                "sqlite_error=%s/%s)",
-                getattr(self, "session_id", None),
-                self._last_persistence_error_cause,
-                _sqlite_code,
-                _sqlite_name,
-                exc_info=True,
-            )
+            _txn_diag = getattr(e, "hermes_txn_diag", None)
+            if isinstance(_txn_diag, dict):
+                logger.error(
+                    "Session DB transcript flush failed (session=%s cause=%s "
+                    "sqlite_error=%s/%s txn_phase=%s rollback=%s attempt=%s "
+                    "commit_outcome_uncertain=%s)",
+                    getattr(self, "session_id", None),
+                    self._last_persistence_error_cause,
+                    _sqlite_code,
+                    _sqlite_name,
+                    _txn_diag.get("phase"),
+                    _txn_diag.get("rollback"),
+                    _txn_diag.get("attempt"),
+                    _txn_diag.get("commit_outcome_uncertain"),
+                    exc_info=True,
+                )
+            else:
+                logger.error(
+                    "Session DB transcript flush failed (session=%s cause=%s "
+                    "sqlite_error=%s/%s txn_phase=<unavailable> "
+                    "rollback=<unavailable>)",
+                    getattr(self, "session_id", None),
+                    self._last_persistence_error_cause,
+                    _sqlite_code,
+                    _sqlite_name,
+                    exc_info=True,
+                )
             if isinstance(e, StateDbReplacedError):
                 try:
                     divert_session_transcript_jsonl(

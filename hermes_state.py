@@ -5896,13 +5896,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_deadline: Optional[float] = None
         # One-shot transcript I/O retry budget (see transcript_io_retry).
         io_retry_used = False
+        # Transaction diagnostics for the failure exit: which phase raised
+        # (begin/write/commit), whether a rollback was attempted and landed,
+        # and which attempt (1-based) failed. "not_attempted" is distinct
+        # from "ok" — a BEGIN-phase failure never opened a transaction, so
+        # claiming a successful rollback would be fabrication.
+        rollback_outcome = "not_attempted"
+        attempt_no = 0
         # Which transaction phase raised, so the I/O retry can prove the
         # failure happened BEFORE commit: "begin" / "write" / "commit".
         txn_phase = "begin"
-        # Whether the post-failure rollback actually succeeded — a failed
-        # rollback means the transaction state is unknown and nothing may
-        # be retried or assumed rolled back.
-        rollback_ok = True
+
+        def _record_txn_failure(exc: BaseException) -> None:
+            """Final-failure diagnostics for every SQLite transaction exit.
+
+            The review contract: the surviving log must state which phase
+            raised (begin/write/commit), whether a rollback was attempted
+            and landed, which attempt failed, and whether a COMMIT-phase
+            failure leaves the commit outcome uncertain. The same dict
+            rides on the exception (hermes_txn_diag) so upper layers
+            (run_agent's flush logging) can include it without re-deriving
+            anything."""
+            _f_code, _f_name = sqlite_error_code_and_name(exc)
+            diag = {
+                "phase": txn_phase,
+                "rollback": rollback_outcome,
+                "attempt": attempt_no,
+                "sqlite_errorcode": _f_code,
+                "sqlite_errorname": _f_name,
+                "io_retry_used": io_retry_used,
+                "commit_outcome_uncertain": txn_phase == "commit",
+            }
+            logger.error(
+                "SQLite transaction failed terminally phase=%s rollback=%s "
+                "attempt=%s sqlite_error=%s/%s io_retry_used=%s "
+                "commit_outcome_uncertain=%s: %s",
+                diag["phase"],
+                diag["rollback"],
+                diag["attempt"],
+                _f_code,
+                _f_name,
+                diag["io_retry_used"],
+                diag["commit_outcome_uncertain"],
+                exc,
+            )
+            try:
+                setattr(exc, "hermes_txn_diag", diag)
+            except Exception:
+                pass
 
         # Transient engine-level error observed on contended WAL appends
         # (dual gateway/agent writers; FTS5 trigram sync holds the write
@@ -5917,7 +5958,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         while True:
             self._raise_if_db_replaced()
             txn_phase = "begin"
-            rollback_ok = True
+            rollback_outcome = "not_attempted"
+            attempt_no += 1
             try:
                 with self._lock:
                     if self._conn is None:
@@ -5937,7 +5979,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # visible in diagnostics.
                         try:
                             self._conn.rollback()
+                            rollback_outcome = "ok"
                         except Exception as rollback_exc:
+                            rollback_outcome = "failed"
                             rollback_ok = False
                             _rb_code, _rb_name = sqlite_error_code_and_name(
                                 rollback_exc
@@ -5958,7 +6002,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
-            except SessionCompressionInProgressError:
+            except SessionCompressionInProgressError as exc:
                 # A live foreign compression lock is transient: the compressor
                 # publishes in a couple of seconds. Without any wait, a steer
                 # that lands mid-compression aborts the user's turn as
@@ -5978,6 +6022,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     compression_deadline, self._COMPRESSION_BUSY_WAIT_S
                 ):
                     continue
+                _record_txn_failure(exc)
                 raise
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
@@ -5986,13 +6031,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         continue
                     # Patience exhausted — say what actually happened so the
                     # surfaced error doesn't read as disk/permission damage.
-                    raise sqlite3.OperationalError(
+                    wrapped = sqlite3.OperationalError(
                         f"database is locked (another Hermes process held the "
                         f"state.db write lock for over {patience_s:.0f}s — "
                         "likely a long maintenance operation such as VACUUM, "
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
-                    ) from exc
+                    )
+                    _record_txn_failure(wrapped)
+                    raise wrapped from exc
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 # Transcript-only single I/O retry: SQLITE_IOERR raised by the
@@ -6006,7 +6053,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     transcript_io_retry
                     and not io_retry_used
                     and txn_phase == "write"
-                    and rollback_ok
+                    and rollback_outcome == "ok"
                     and is_sqlite_io_error(exc)
                 ):
                     io_retry_used = True
@@ -6031,7 +6078,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "transcript I/O retry skipped: connection still in "
                         "transaction after rollback"
                     )
-                # Non-lock error or patience exhausted — propagate.
+                # Non-lock error or patience exhausted — propagate with the
+                # full transaction diagnostics.
+                _record_txn_failure(exc)
                 raise
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
@@ -6056,6 +6105,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # explicit repair paths retain rebuild ownership.
                 if self._enter_fts_fail_open(exc):
                     continue
+                _record_txn_failure(exc)
                 raise
             except sqlite3.Error as exc:
                 # Catch-all for builds that surface 'no more rows available'
@@ -6065,6 +6115,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # untouched.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
+                _record_txn_failure(exc)
                 raise
 
     def _ensure_db_file_generation(self) -> None:
